@@ -8,6 +8,20 @@ This project ships with a `Dockerfile` for building and running 9Router in a con
 docker build -t 9router .
 ```
 
+```bash
+docker buildx build --platform linux/amd64 -t 9router .
+```
+
+
+```bash
+docker tag 9router:latest daongoc315/9router:v0.3.39-1 
+```
+
+```bash
+docker push  daongoc315/9router:v0.3.39-1
+```
+
+
 ## Start container
 
 ```bash

@@ -4,8 +4,6 @@ import { useState, useEffect, useRef } from "react";
 import { Card, Button, ModelSelectModal, ManualConfigModal } from "@/shared/components";
 import Image from "next/image";
 
-const CLOUD_URL = process.env.NEXT_PUBLIC_CLOUD_URL;
-
 export default function DroidToolCard({
   tool,
   isExpanded,
@@ -14,7 +12,6 @@ export default function DroidToolCard({
   hasActiveProviders,
   apiKeys,
   activeProviders,
-  cloudEnabled,
   initialStatus,
 }) {
   const [droidStatus, setDroidStatus] = useState(initialStatus || null);
@@ -35,9 +32,8 @@ export default function DroidToolCard({
     const currentConfig = droidStatus.settings?.customModels?.find(m => m.id === "custom:9Router-0");
     if (!currentConfig) return "not_configured";
     const localMatch = currentConfig.baseUrl?.includes("localhost") || currentConfig.baseUrl?.includes("127.0.0.1");
-    const cloudMatch = cloudEnabled && CLOUD_URL && currentConfig.baseUrl?.startsWith(CLOUD_URL);
     const tunnelMatch = baseUrl && currentConfig.baseUrl?.startsWith(baseUrl);
-    if (localMatch || cloudMatch || tunnelMatch) return "configured";
+    if (localMatch || tunnelMatch) return "configured";
     return "other";
   };
 
@@ -113,7 +109,7 @@ export default function DroidToolCard({
     try {
       const keyToUse = selectedApiKey?.trim() 
         || (apiKeys?.length > 0 ? apiKeys[0].key : null)
-        || (!cloudEnabled ? "sk_9router" : null);
+        || "sk_9router";
 
       const res = await fetch("/api/cli-tools/droid-settings", {
         method: "POST",
@@ -167,7 +163,7 @@ export default function DroidToolCard({
   const getManualConfigs = () => {
     const keyToUse = (selectedApiKey && selectedApiKey.trim()) 
       ? selectedApiKey 
-      : (!cloudEnabled ? "sk_9router" : "<API_KEY_FROM_DASHBOARD>");
+      : "sk_9router";
 
     const settingsContent = {
       customModels: [
@@ -280,7 +276,7 @@ export default function DroidToolCard({
                     </select>
                   ) : (
                     <span className="flex-1 text-xs text-text-muted px-2 py-1.5">
-                      {cloudEnabled ? "No API keys - Create one in Keys page" : "sk_9router (default)"}
+                      {"sk_9router (default)"}
                     </span>
                   )}
                 </div>

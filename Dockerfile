@@ -1,11 +1,20 @@
 # syntax=docker/dockerfile:1.7
-ARG BUN_IMAGE=oven/bun:1.3.2-alpine
+ARG BUN_IMAGE=oven/bun:1.3.2-slim
 FROM ${BUN_IMAGE} AS base
 WORKDIR /app
 
-FROM base AS builder
+# Builder runs on the host's native platform to avoid QEMU/SWC crashes
+# Next.js output (JS/HTML/CSS) is architecture-independent
+FROM --platform=$BUILDPLATFORM node:20-slim AS builder
+WORKDIR /app
 
-RUN apk --no-cache upgrade && apk --no-cache add nodejs npm python3 make g++ linux-headers
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    make \
+    g++ \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY package.json ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -15,7 +24,7 @@ COPY . ./
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
-FROM ${BUN_IMAGE} AS runner
+FROM base AS runner
 WORKDIR /app
 
 LABEL org.opencontainers.image.title="9router"
@@ -34,11 +43,13 @@ COPY --from=builder /app/src/mitm ./src/mitm
 # Standalone node_modules may omit deps only required by the MITM child process.
 COPY --from=builder /app/node_modules/node-forge ./node_modules/node-forge
 
-RUN mkdir -p /app/data && chown -R bun:bun /app
+RUN apt-get update && apt-get install -y --no-install-recommends gosu ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /app/data && chown -R bun:bun /app/data
 
 # Fix permissions at runtime (handles mounted volumes)
-RUN apk --no-cache upgrade && apk --no-cache add su-exec && \
-  printf '#!/bin/sh\nchown -R bun:bun /app/data 2>/dev/null\nexec su-exec bun "$@"\n' > /entrypoint.sh && \
+RUN printf '#!/bin/sh\nset -e\nchown -R bun:bun /app/data 2>/dev/null || true\nexec gosu bun "$@"\n' > /entrypoint.sh && \
   chmod +x /entrypoint.sh
 
 EXPOSE 20128

@@ -8,7 +8,7 @@ import lockfile from "proper-lockfile";
 
 const DEFAULT_MITM_ROUTER_BASE = "http://localhost:20128";
 
-const isCloud = typeof caches !== 'undefined' || typeof caches === 'object';
+const isCloud = false;
 
 // Get app name - fixed constant to avoid Windows path issues in standalone build
 function getAppName() {
@@ -52,7 +52,6 @@ const defaultData = {
   combos: [],
   apiKeys: [],
   settings: {
-    cloudEnabled: false,
     tunnelEnabled: false,
     tunnelUrl: "",
     tailscaleEnabled: false,
@@ -61,6 +60,7 @@ const defaultData = {
     providerStrategies: {},
     comboStrategy: "fallback",
     comboStrategies: {},
+    requireApiKey: true,
     requireLogin: true,
     tunnelDashboardAccess: true,
     observabilityEnabled: true,
@@ -91,7 +91,6 @@ function cloneDefaultData() {
     combos: [],
     apiKeys: [],
     settings: {
-      cloudEnabled: false,
       tunnelEnabled: false,
       tunnelUrl: "",
       tunnelProvider: "cloudflare",
@@ -99,6 +98,7 @@ function cloneDefaultData() {
       providerStrategies: {},
       comboStrategy: "fallback",
       comboStrategies: {},
+      requireApiKey: true,
       requireLogin: true,
       tunnelDashboardAccess: true,
       observabilityEnabled: true,
@@ -1012,7 +1012,7 @@ export async function cleanupProviderConnections() {
  */
 export async function getSettings() {
   const db = await getDb();
-  return db.data.settings || { cloudEnabled: false };
+  return db.data.settings || {};
 }
 
 /**
@@ -1061,25 +1061,6 @@ export async function importDb(payload) {
   await safeWrite(db);
 
   return db.data;
-}
-
-/**
- * Check if cloud is enabled
- */
-export async function isCloudEnabled() {
-  const settings = await getSettings();
-  return settings.cloudEnabled === true;
-}
-
-/**
- * Get cloud URL (UI config > env > default)
- */
-export async function getCloudUrl() {
-  const settings = await getSettings();
-  return settings.cloudUrl
-    || process.env.CLOUD_URL
-    || process.env.NEXT_PUBLIC_CLOUD_URL
-    || "";
 }
 
 // ============ Pricing ============

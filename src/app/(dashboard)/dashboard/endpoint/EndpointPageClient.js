@@ -76,7 +76,7 @@ export default function APIPageClient({ machineId }) {
       ]);
       if (settingsRes.ok) {
         const data = await settingsRes.json();
-        setRequireApiKey(data.requireApiKey || false);
+        setRequireApiKey(data.requireApiKey !== false);
         setRequireLogin(data.requireLogin !== false);
         setHasPassword(data.hasPassword || false);
         setTunnelDashboardAccess(data.tunnelDashboardAccess || false);

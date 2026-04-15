@@ -21,7 +21,6 @@ export default function MitmToolCard({
   activeProviders,
   hasActiveProviders,
   modelAliases = {},
-  cloudEnabled,
   onDnsChange,
 }) {
   const [loading, setLoading] = useState(false);

@@ -1,6 +1,9 @@
 import {
   extractApiKey, isValidApiKey,
   getProviderCredentials, markAccountUnavailable,
+  getInvalidApiKeyRateLimitStatus,
+  markInvalidApiKeyAttempt,
+  clearInvalidApiKeyAttempts,
 } from "../services/auth.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo } from "../services/model.js";
@@ -27,10 +30,45 @@ export async function handleTts(request) {
 
   const settings = await getSettings();
   if (settings.requireApiKey) {
+    const rateLimitStatus = getInvalidApiKeyRateLimitStatus(request);
+    if (rateLimitStatus.blocked) {
+      return new Response(
+        JSON.stringify({ error: { message: "Too many invalid API key attempts. Please try again later." } }),
+        {
+          status: HTTP_STATUS.TOO_MANY_REQUESTS,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Retry-After": String(rateLimitStatus.retryAfterSeconds)
+          }
+        }
+      );
+    }
+
     const apiKey = extractApiKey(request);
     if (!apiKey) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
+
     const valid = await isValidApiKey(apiKey);
-    if (!valid) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
+    if (!valid) {
+      markInvalidApiKeyAttempt(request);
+      const nextRateLimitStatus = getInvalidApiKeyRateLimitStatus(request);
+      if (nextRateLimitStatus.blocked) {
+        return new Response(
+          JSON.stringify({ error: { message: "Too many invalid API key attempts. Please try again later." } }),
+          {
+            status: HTTP_STATUS.TOO_MANY_REQUESTS,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+              "Retry-After": String(nextRateLimitStatus.retryAfterSeconds)
+            }
+          }
+        );
+      }
+      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
+    }
+
+    clearInvalidApiKeyAttempts(request);
   }
 
   if (!modelStr) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");

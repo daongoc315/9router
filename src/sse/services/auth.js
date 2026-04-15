@@ -7,6 +7,70 @@ import * as log from "../utils/logger.js";
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
 
+const INVALID_API_KEY_WINDOW_MS = Number(process.env.INVALID_API_KEY_RATE_LIMIT_WINDOW_MS || 60 * 1000);
+const INVALID_API_KEY_MAX_ATTEMPTS = Number(process.env.INVALID_API_KEY_RATE_LIMIT_MAX_ATTEMPTS || 20);
+const INVALID_API_KEY_BLOCK_MS = Number(process.env.INVALID_API_KEY_RATE_LIMIT_BLOCK_MS || 10 * 60 * 1000);
+const invalidApiKeyAttempts = new Map();
+
+function getClientIdentifier(request) {
+  const forwardedFor = request?.headers?.get("x-forwarded-for") || "";
+  const firstForwardedIp = forwardedFor.split(",")[0]?.trim();
+  if (firstForwardedIp) return firstForwardedIp;
+
+  const realIp = request?.headers?.get("x-real-ip")?.trim();
+  if (realIp) return realIp;
+
+  const host = request?.headers?.get("host") || "unknown-host";
+  return `host:${host}`;
+}
+
+export function getInvalidApiKeyRateLimitStatus(request) {
+  const clientId = getClientIdentifier(request);
+  const entry = invalidApiKeyAttempts.get(clientId);
+  const now = Date.now();
+
+  if (!entry) {
+    return { blocked: false, retryAfterSeconds: 0 };
+  }
+
+  if (entry.blockedUntil && entry.blockedUntil > now) {
+    return {
+      blocked: true,
+      retryAfterSeconds: Math.ceil((entry.blockedUntil - now) / 1000)
+    };
+  }
+
+  if (entry.windowStart + INVALID_API_KEY_WINDOW_MS <= now) {
+    invalidApiKeyAttempts.delete(clientId);
+  }
+
+  return { blocked: false, retryAfterSeconds: 0 };
+}
+
+export function markInvalidApiKeyAttempt(request) {
+  const clientId = getClientIdentifier(request);
+  const now = Date.now();
+  const entry = invalidApiKeyAttempts.get(clientId);
+
+  if (!entry || entry.windowStart + INVALID_API_KEY_WINDOW_MS <= now) {
+    invalidApiKeyAttempts.set(clientId, { attempts: 1, windowStart: now, blockedUntil: 0 });
+    return;
+  }
+
+  const attempts = entry.attempts + 1;
+  const blockedUntil = attempts >= INVALID_API_KEY_MAX_ATTEMPTS ? now + INVALID_API_KEY_BLOCK_MS : 0;
+  invalidApiKeyAttempts.set(clientId, {
+    attempts,
+    windowStart: entry.windowStart,
+    blockedUntil
+  });
+}
+
+export function clearInvalidApiKeyAttempts(request) {
+  const clientId = getClientIdentifier(request);
+  invalidApiKeyAttempts.delete(clientId);
+}
+
 /**
  * Get provider credentials from localDb
  * Filters out unavailable accounts and returns the selected account based on strategy

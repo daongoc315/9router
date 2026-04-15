@@ -6,6 +6,9 @@ import {
   clearAccountError,
   extractApiKey,
   isValidApiKey,
+  getInvalidApiKeyRateLimitStatus,
+  markInvalidApiKeyAttempt,
+  clearInvalidApiKeyAttempts,
 } from "../services/auth.js";
 import { cacheClaudeHeaders } from "open-sse/utils/claudeHeaderCache.js";
 import { getSettings } from "@/lib/localDb";
@@ -68,15 +71,48 @@ export async function handleChat(request, clientRawRequest = null) {
   // Enforce API key if enabled in settings
   const settings = await getSettings();
   if (settings.requireApiKey) {
+    const rateLimitStatus = getInvalidApiKeyRateLimitStatus(request);
+    if (rateLimitStatus.blocked) {
+      return new Response(
+        JSON.stringify({ error: { message: "Too many invalid API key attempts. Please try again later." } }),
+        {
+          status: HTTP_STATUS.TOO_MANY_REQUESTS,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Retry-After": String(rateLimitStatus.retryAfterSeconds)
+          }
+        }
+      );
+    }
+
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
     }
+
     const valid = await isValidApiKey(apiKey);
     if (!valid) {
+      markInvalidApiKeyAttempt(request);
+      const nextRateLimitStatus = getInvalidApiKeyRateLimitStatus(request);
+      if (nextRateLimitStatus.blocked) {
+        return new Response(
+          JSON.stringify({ error: { message: "Too many invalid API key attempts. Please try again later." } }),
+          {
+            status: HTTP_STATUS.TOO_MANY_REQUESTS,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+              "Retry-After": String(nextRateLimitStatus.retryAfterSeconds)
+            }
+          }
+        );
+      }
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
+
+    clearInvalidApiKeyAttempts(request);
   }
 
   if (!modelStr) {

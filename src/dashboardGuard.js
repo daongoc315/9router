@@ -8,7 +8,6 @@ const SECRET = new TextEncoder().encode(
 
 // Always require JWT token regardless of requireLogin setting
 const ALWAYS_PROTECTED = [
-  "/api/shutdown",
   "/api/settings/database",
 ];
 

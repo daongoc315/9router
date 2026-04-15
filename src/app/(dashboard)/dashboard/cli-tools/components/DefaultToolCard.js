@@ -4,7 +4,7 @@ import { useState } from "react";
 import { Card, ModelSelectModal } from "@/shared/components";
 import Image from "next/image";
 
-export default function DefaultToolCard({ toolId, tool, isExpanded, onToggle, baseUrl, apiKeys, activeProviders = [], cloudEnabled = false, tunnelEnabled = false }) {
+export default function DefaultToolCard({ toolId, tool, isExpanded, onToggle, baseUrl, apiKeys, activeProviders = [], tunnelEnabled = false }) {
   const [copiedField, setCopiedField] = useState(null);
   const [showModelModal, setShowModelModal] = useState(false);
   const [modelValue, setModelValue] = useState("");
@@ -17,7 +17,7 @@ export default function DefaultToolCard({ toolId, tool, isExpanded, onToggle, ba
   const replaceVars = (text) => {
     const keyToUse = (selectedApiKey && selectedApiKey.trim()) 
       ? selectedApiKey 
-      : (!cloudEnabled ? "sk_9router" : "your-api-key");
+      : "sk_9router";
     
     // Add /v1 suffix only if not already present (DRY - avoid duplicate)
     const normalizedBaseUrl = baseUrl || "http://localhost:20128";
@@ -68,7 +68,7 @@ export default function DefaultToolCard({ toolId, tool, isExpanded, onToggle, ba
           </>
         ) : (
           <span className="text-sm text-text-muted">
-            {cloudEnabled ? "No API keys - Create one in Keys page" : "sk_9router"}
+            {"sk_9router"}
           </span>
         )}
       </div>
@@ -126,10 +126,10 @@ export default function DefaultToolCard({ toolId, tool, isExpanded, onToggle, ba
       <div className="flex flex-col gap-2 mb-4">
         {tool.notes.map((note, index) => {
           // Skip cloudCheck note if tunnel or cloud is enabled
-          if (note.type === "cloudCheck" && (cloudEnabled || tunnelEnabled)) return null;
-          
+          if (note.type === "cloudCheck" && tunnelEnabled) return null;
+
           const isWarning = note.type === "warning";
-          const isError = note.type === "cloudCheck" && !cloudEnabled && !tunnelEnabled;
+          const isError = note.type === "cloudCheck" && !tunnelEnabled;
           
           let bgClass = "bg-blue-500/10 border-blue-500/30";
           let textClass = "text-blue-600 dark:text-blue-400";
@@ -160,8 +160,8 @@ export default function DefaultToolCard({ toolId, tool, isExpanded, onToggle, ba
   };
 
   const canShowGuide = () => {
-    if (tool.requiresExternalUrl && !cloudEnabled && !tunnelEnabled) return false;
-    if (tool.requiresCloud && !cloudEnabled) return false;
+    if (tool.requiresExternalUrl && !tunnelEnabled) return false;
+    if (tool.requiresCloud) return false;
     return true;
   };
 

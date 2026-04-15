@@ -6,7 +6,6 @@ import Link from "next/link";
 import PropTypes from "prop-types";
 import ProviderIcon from "@/shared/components/ProviderIcon";
 import { ThemeToggle, LanguageSwitcher } from "@/shared/components";
-import NineRemoteButton from "@/shared/components/NineRemoteButton";
 import { OAUTH_PROVIDERS, APIKEY_PROVIDERS } from "@/shared/constants/config";
 import { MEDIA_PROVIDER_KINDS, AI_PROVIDERS } from "@/shared/constants/providers";
 import { translate } from "@/i18n/runtime";
@@ -251,9 +250,6 @@ export default function Header({ onMenuClick, showMenuButton = true }) {
 
       {/* Right actions */}
       <div className="flex items-center gap-3 ml-auto">
-        {/* 9Remote button */}
-        <NineRemoteButton />
-
         {/* Language switcher */}
         <LanguageSwitcher />
 
