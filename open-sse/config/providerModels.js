@@ -16,7 +16,11 @@ export const PROVIDER_MODELS = {
   ],
   cx: [  // OpenAI Codex
     { id: "gpt-5.4", name: "GPT 5.4" },
+    { id: "gpt-5.4-xhigh", name: "GPT 5.4 (xHigh)" },
+    { id: "gpt-5.4-high", name: "GPT 5.4 (High)" },
     { id: "gpt-5.4-mini", name: "GPT 5.4 Mini" },
+    { id: "gpt-5.4-mini-xhigh", name: "GPT 5.4 Mini (xHigh)" },
+    { id: "gpt-5.4-mini-high", name: "GPT 5.4 Mini (High)" },
     // GPT 5.3 Codex - all thinking levels
     { id: "gpt-5.3-codex", name: "GPT 5.3 Codex" },
     { id: "gpt-5.3-codex-xhigh", name: "GPT 5.3 Codex (xHigh)" },
