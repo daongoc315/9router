@@ -176,6 +176,10 @@ function ensureDbShape(data) {
 // Singleton instance
 let dbInstance = null;
 
+// In-memory cache TTL: avoid re-reading disk on every request under concurrent load
+const DB_READ_CACHE_TTL_MS = 10000; // 10 seconds
+let dbCachedAt = 0;
+
 // Lock options for proper-lockfile (increased retries for multi-process robustness)
 const LOCK_OPTIONS = {
   retries: {
@@ -269,6 +273,7 @@ async function safeWrite(db) {
     // Acquire file lock (cross-process serialization)
     release = await lockfile.lock(DB_FILE, LOCK_OPTIONS);
     await db.write();
+    dbCachedAt = Date.now(); // Data on disk matches in-memory state
   } catch (error) {
     if (error.code === "ELOCKED") {
       console.warn("[DB] File is locked, retrying write...");
@@ -306,9 +311,15 @@ export async function getDb() {
     dbInstance = new Low(adapter, cloneDefaultData());
   }
 
-  // Always read latest disk state to avoid stale singleton data across route workers.
+  // Skip disk read if cache is still fresh (avoids file-lock contention under concurrent load)
+  if (Date.now() - dbCachedAt < DB_READ_CACHE_TTL_MS) {
+    return dbInstance;
+  }
+
+  // Read latest disk state to stay in sync across route workers.
   try {
     await safeRead(dbInstance);
+    dbCachedAt = Date.now();
   } catch (error) {
     if (error instanceof SyntaxError) {
       console.warn('[DB] Corrupt JSON detected, resetting to defaults...');

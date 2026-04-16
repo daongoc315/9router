@@ -98,6 +98,149 @@ const pendingTimers = global._pendingTimers;
 
 const PENDING_TIMEOUT_MS = 60 * 1000; // 1 minute
 
+// ── In-memory aggregated stats ────────────────────────────────────────────────
+// Only pre-computed metrics are kept in memory — NOT raw history entries.
+// Raw entries are buffered and flushed to disk (usage.json) every 5 seconds.
+// On startup, aggregates are rebuilt by scanning history once.
+const MAX_HISTORY = 10000;
+const FLUSH_INTERVAL_MS = 5000;
+
+function makeEmptyInMemStats() {
+  return {
+    loaded: false,
+    totalRequests: 0,
+    totalPromptTokens: 0,
+    totalCompletionTokens: 0,
+    totalCost: 0,
+    byProvider: {},
+    byModel: {},
+    byAccount: {},   // key: `model|provider|connectionId`
+    byApiKey: {},    // key: `apiKey|model|provider`
+    byEndpoint: {},  // key: `endpoint|model|provider`
+    recentRequests: [],  // last 20, lightweight { timestamp, model, provider, promptTokens, completionTokens, status }
+    minuteEntries: [],   // last ~12 min, lightweight { timestamp, promptTokens, completionTokens, cost }
+  };
+}
+
+if (!global._inMemStats)         global._inMemStats = makeEmptyInMemStats();
+if (!global._writeBuffer)        global._writeBuffer = [];
+if (!global._writeFlushTimer)    global._writeFlushTimer = null;
+if (!global._statsLoadPromise)   global._statsLoadPromise = null;
+
+/** Incrementally add one entry into all in-memory aggregates. O(1). */
+function addEntryToStats(entry) {
+  const s = global._inMemStats;
+  const promptTokens = entry.tokens?.prompt_tokens || entry.tokens?.input_tokens || 0;
+  const completionTokens = entry.tokens?.completion_tokens || entry.tokens?.output_tokens || 0;
+  const cost = entry.cost || 0;
+  const ts = entry.timestamp || new Date().toISOString();
+
+  s.totalPromptTokens += promptTokens;
+  s.totalCompletionTokens += completionTokens;
+  s.totalCost += cost;
+
+  // byProvider
+  const pKey = entry.provider || "unknown";
+  if (!s.byProvider[pKey]) s.byProvider[pKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0 };
+  const pv = s.byProvider[pKey];
+  pv.requests++; pv.promptTokens += promptTokens; pv.completionTokens += completionTokens; pv.cost += cost;
+
+  // byModel
+  const mKey = entry.provider ? `${entry.model} (${entry.provider})` : entry.model;
+  if (!s.byModel[mKey]) s.byModel[mKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0, rawModel: entry.model, provider: entry.provider || "", lastUsed: ts };
+  const mv = s.byModel[mKey];
+  mv.requests++; mv.promptTokens += promptTokens; mv.completionTokens += completionTokens; mv.cost += cost;
+  if (ts > mv.lastUsed) mv.lastUsed = ts;
+
+  // byAccount (display name resolved at serve time)
+  if (entry.connectionId) {
+    const aKey = `${entry.model}|${entry.provider || ""}|${entry.connectionId}`;
+    if (!s.byAccount[aKey]) s.byAccount[aKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0, rawModel: entry.model, provider: entry.provider || "", connectionId: entry.connectionId, lastUsed: ts };
+    const av = s.byAccount[aKey];
+    av.requests++; av.promptTokens += promptTokens; av.completionTokens += completionTokens; av.cost += cost;
+    if (ts > av.lastUsed) av.lastUsed = ts;
+  }
+
+  // byApiKey
+  const rawApiKey = (entry.apiKey && typeof entry.apiKey === "string") ? entry.apiKey : null;
+  const akKey = `${rawApiKey || "local-no-key"}|${entry.model}|${entry.provider || "unknown"}`;
+  if (!s.byApiKey[akKey]) s.byApiKey[akKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0, rawModel: entry.model, provider: entry.provider || "", apiKey: rawApiKey, apiKeyKey: rawApiKey || "local-no-key", lastUsed: ts };
+  const akv = s.byApiKey[akKey];
+  akv.requests++; akv.promptTokens += promptTokens; akv.completionTokens += completionTokens; akv.cost += cost;
+  if (ts > akv.lastUsed) akv.lastUsed = ts;
+
+  // byEndpoint
+  const endpoint = entry.endpoint || "Unknown";
+  const eKey = `${endpoint}|${entry.model}|${entry.provider || "unknown"}`;
+  if (!s.byEndpoint[eKey]) s.byEndpoint[eKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0, endpoint, rawModel: entry.model, provider: entry.provider || "", lastUsed: ts };
+  const ev = s.byEndpoint[eKey];
+  ev.requests++; ev.promptTokens += promptTokens; ev.completionTokens += completionTokens; ev.cost += cost;
+  if (ts > ev.lastUsed) ev.lastUsed = ts;
+
+  // recentRequests: last 20, only if has tokens
+  if (promptTokens > 0 || completionTokens > 0) {
+    s.recentRequests.unshift({ timestamp: ts, model: entry.model, provider: entry.provider || "", promptTokens, completionTokens, status: entry.status || "ok" });
+    if (s.recentRequests.length > 20) s.recentRequests.length = 20;
+  }
+
+  // minuteEntries: rolling window for last10Minutes chart
+  s.minuteEntries.push({ timestamp: ts, promptTokens, completionTokens, cost });
+  if (s.minuteEntries.length > 300) {
+    const cutoff = Date.now() - 12 * 60 * 1000;
+    s.minuteEntries = s.minuteEntries.filter(me => new Date(me.timestamp).getTime() >= cutoff);
+  }
+}
+
+/** Load aggregates from disk once on startup. Called automatically or via instrumentation. */
+export function ensureStatsLoaded() {
+  if (global._inMemStats.loaded) return Promise.resolve();
+  if (global._statsLoadPromise) return global._statsLoadPromise;
+
+  global._statsLoadPromise = (async () => {
+    if (isCloud) { global._inMemStats.loaded = true; return; }
+    try {
+      const db = await getUsageDb();
+      const history = db.data.history || [];
+      for (const entry of history) addEntryToStats(entry);
+      // totalRequests uses lifetime counter (history may be capped at 10K)
+      global._inMemStats.totalRequests = db.data.totalRequestsLifetime || history.length;
+    } catch (error) {
+      console.error("[usageDb] Failed to load stats:", error.message);
+    }
+    global._inMemStats.loaded = true;
+    global._statsLoadPromise = null;
+  })();
+
+  return global._statsLoadPromise;
+}
+
+/** Flush raw write buffer to usage.json (batched). */
+async function flushToDisk() {
+  if (isCloud || global._writeBuffer.length === 0) return;
+  const toWrite = global._writeBuffer.splice(0);
+  try {
+    const db = await getUsageDb();
+    if (!Array.isArray(db.data.history)) db.data.history = [];
+    for (const entry of toWrite) db.data.history.push(entry);
+    db.data.totalRequestsLifetime = global._inMemStats.totalRequests;
+    if (db.data.history.length > MAX_HISTORY) {
+      db.data.history.splice(0, db.data.history.length - MAX_HISTORY);
+    }
+    await db.write();
+  } catch (error) {
+    global._writeBuffer.unshift(...toWrite); // put back on failure
+    console.error("[usageDb] Flush failed:", error.message);
+  }
+}
+
+function scheduleFlush() {
+  if (global._writeFlushTimer) return;
+  global._writeFlushTimer = setTimeout(async () => {
+    global._writeFlushTimer = null;
+    await flushToDisk();
+  }, FLUSH_INTERVAL_MS);
+}
+
 /**
  * Track a pending request
  * @param {string} model
@@ -179,28 +322,9 @@ export async function getActiveRequests() {
     }
   }
 
-  // Get recent requests from history (re-read to get latest)
-  const db = await getUsageDb();
-  await db.read();
-  const history = db.data.history || [];
-  const seen = new Set();
-  const recentRequests = [...history]
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-    .map((e) => {
-      const t = e.tokens || {};
-      const promptTokens = t.prompt_tokens || t.input_tokens || 0;
-      const completionTokens = t.completion_tokens || t.output_tokens || 0;
-      return { timestamp: e.timestamp, model: e.model, provider: e.provider || "", promptTokens, completionTokens, status: e.status || "ok" };
-    })
-    .filter((e) => {
-      if (e.promptTokens === 0 && e.completionTokens === 0) return false;
-      const minute = e.timestamp ? e.timestamp.slice(0, 16) : "";
-      const key = `${e.model}|${e.provider}|${e.promptTokens}|${e.completionTokens}|${minute}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .slice(0, 20);
+  // Recent requests from in-memory aggregates (no disk read needed)
+  await ensureStatsLoaded();
+  const recentRequests = global._inMemStats.recentRequests;
 
   // Error provider (auto-clear after 10s)
   const errorProvider = (Date.now() - lastErrorProvider.ts < 10000) ? lastErrorProvider.provider : "";
@@ -252,36 +376,21 @@ export async function getUsageDb() {
  * @param {object} entry - Usage entry { provider, model, tokens: { prompt_tokens, completion_tokens, ... }, connectionId?, apiKey? }
  */
 export async function saveRequestUsage(entry) {
-  if (isCloud) return; // Skip saving in Workers
-
+  if (isCloud) return;
   try {
-    const db = await getUsageDb();
-
-    // Add timestamp if not present
-    if (!entry.timestamp) {
-      entry.timestamp = new Date().toISOString();
-    }
-
-    // Ensure history array exists
-    if (!Array.isArray(db.data.history)) {
-      db.data.history = [];
-    }
-    if (typeof db.data.totalRequestsLifetime !== "number") {
-      db.data.totalRequestsLifetime = db.data.history.length;
-    }
-
+    await ensureStatsLoaded();
+    if (!entry.timestamp) entry.timestamp = new Date().toISOString();
     const entryCost = await calculateCost(entry.provider, entry.model, entry.tokens);
     entry.cost = entryCost;
-    db.data.history.push(entry);
-    db.data.totalRequestsLifetime += 1;
 
-    // Cap history to prevent unbounded memory/disk growth
-    const MAX_HISTORY = 10000;
-    if (db.data.history.length > MAX_HISTORY) {
-      db.data.history.splice(0, db.data.history.length - MAX_HISTORY);
-    }
+    // Update in-memory aggregates (no disk I/O)
+    addEntryToStats(entry);
+    global._inMemStats.totalRequests += 1;
 
-    await db.write();
+    // Buffer raw entry for batched disk flush
+    global._writeBuffer.push(entry);
+    scheduleFlush();
+
     statsEmitter.emit("update");
   } catch (error) {
     console.error("Failed to save usage stats:", error);
@@ -344,16 +453,8 @@ export async function appendRequestLog({ model, provider, connectionId, tokens, 
     const p = provider?.toUpperCase() || "-";
     const m = model || "-";
 
-    // Resolve account name
-    let account = connectionId ? connectionId.slice(0, 8) : "-";
-    try {
-      const { getProviderConnections } = await import("@/lib/localDb.js");
-      const connections = await getProviderConnections();
-      const conn = connections.find(c => c.id === connectionId);
-      if (conn) {
-        account = conn.name || conn.email || account;
-      }
-    } catch {}
+    // Use short connectionId as account identifier (avoid db read per request)
+    const account = connectionId ? connectionId.slice(0, 8) : "-";
 
     const sent = tokens?.prompt_tokens !== undefined ? tokens.prompt_tokens : "-";
     const received = tokens?.completion_tokens !== undefined ? tokens.completion_tokens : "-";
@@ -362,7 +463,8 @@ export async function appendRequestLog({ model, provider, connectionId, tokens, 
 
     fs.appendFileSync(LOG_FILE, line);
 
-    // Trim to keep only last 200 lines
+    // TODO: move trim to read-time (getRecentLogs) instead of write-time to avoid
+    // readFileSync + writeFileSync blocking on every request
     const content = fs.readFileSync(LOG_FILE, "utf-8");
     const lines = content.trim().split("\n");
     if (lines.length > 200) {
@@ -469,6 +571,96 @@ const PERIOD_MS = { "24h": 86400000, "7d": 604800000, "30d": 2592000000, "60d": 
  * @param {"24h"|"7d"|"30d"|"60d"|"all"} period - Time period to filter
  */
 export async function getUsageStats(period = "all") {
+  // "all" period: serve entirely from in-memory aggregates (no disk I/O)
+  if (!period || period === "all") return buildStatsFromMemory();
+  // Period-filtered: read from disk (user-triggered, not SSE hot path)
+  return buildStatsFromDisk(period);
+}
+
+/** Serve stats from in-memory aggregates. Zero disk I/O. */
+async function buildStatsFromMemory() {
+  await ensureStatsLoaded();
+  const s = global._inMemStats;
+
+  // Resolve display names (uses TTL-cached localDb — fast)
+  const { getProviderConnections, getApiKeys, getProviderNodes } = await import("@/lib/localDb.js");
+  let connectionMap = {}, providerNodeNameMap = {}, apiKeyMap = {};
+  try { const cs = await getProviderConnections(); for (const c of cs) connectionMap[c.id] = c.name || c.email || c.id; } catch {}
+  try { const ns = await getProviderNodes(); for (const n of ns) if (n.id && n.name) providerNodeNameMap[n.id] = n.name; } catch {}
+  try { const ks = await getApiKeys(); for (const k of ks) apiKeyMap[k.key] = { name: k.name, id: k.id }; } catch {}
+
+  // Resolve byAccount display names
+  const byAccount = {};
+  for (const [, val] of Object.entries(s.byAccount)) {
+    const accountName = connectionMap[val.connectionId] || `Account ${val.connectionId.slice(0, 8)}...`;
+    const displayKey = `${val.rawModel} (${val.provider} - ${accountName})`;
+    byAccount[displayKey] = { ...val, accountName, provider: providerNodeNameMap[val.provider] || val.provider };
+  }
+
+  // Resolve byApiKey display names
+  const byApiKey = {};
+  for (const [key, val] of Object.entries(s.byApiKey)) {
+    const keyInfo = val.apiKey ? apiKeyMap[val.apiKey] : null;
+    const keyName = keyInfo?.name || (val.apiKey ? val.apiKey.slice(0, 8) + "..." : "Local (No API Key)");
+    byApiKey[key] = { ...val, keyName, provider: providerNodeNameMap[val.provider] || val.provider };
+  }
+
+  // Resolve byModel / byEndpoint display names
+  const byModel = {};
+  for (const [key, val] of Object.entries(s.byModel)) byModel[key] = { ...val, provider: providerNodeNameMap[val.provider] || val.provider };
+  const byEndpoint = {};
+  for (const [key, val] of Object.entries(s.byEndpoint)) byEndpoint[key] = { ...val, provider: providerNodeNameMap[val.provider] || val.provider };
+
+  // Build last10Minutes from minuteEntries
+  const now = new Date();
+  const currentMinuteStart = new Date(Math.floor(now.getTime() / 60000) * 60000);
+  const bucketMap = {};
+  const last10Minutes = [];
+  for (let i = 0; i < 10; i++) {
+    const bt = new Date(currentMinuteStart.getTime() - (9 - i) * 60 * 1000);
+    const bucket = { requests: 0, promptTokens: 0, completionTokens: 0, cost: 0 };
+    bucketMap[bt.getTime()] = bucket;
+    last10Minutes.push(bucket);
+  }
+  const tenMinAgo = currentMinuteStart.getTime() - 9 * 60 * 1000;
+  s.minuteEntries = s.minuteEntries.filter(me => new Date(me.timestamp).getTime() >= tenMinAgo - 60000);
+  for (const me of s.minuteEntries) {
+    const bk = Math.floor(new Date(me.timestamp).getTime() / 60000) * 60000;
+    if (bucketMap[bk]) { bucketMap[bk].requests++; bucketMap[bk].promptTokens += me.promptTokens; bucketMap[bk].completionTokens += me.completionTokens; bucketMap[bk].cost += me.cost; }
+  }
+
+  // Build activeRequests from pending
+  const activeRequests = [];
+  for (const [connectionId, models] of Object.entries(pendingRequests.byAccount)) {
+    for (const [modelKey, count] of Object.entries(models)) {
+      if (count > 0) {
+        const accountName = connectionMap[connectionId] || `Account ${connectionId.slice(0, 8)}...`;
+        const match = modelKey.match(/^(.*) \((.*)\)$/);
+        activeRequests.push({ model: match ? match[1] : modelKey, provider: match ? match[2] : "unknown", account: accountName, count });
+      }
+    }
+  }
+
+  return {
+    totalRequests: s.totalRequests,
+    totalPromptTokens: s.totalPromptTokens,
+    totalCompletionTokens: s.totalCompletionTokens,
+    totalCost: s.totalCost,
+    byProvider: s.byProvider,
+    byModel,
+    byAccount,
+    byApiKey,
+    byEndpoint,
+    last10Minutes,
+    pending: pendingRequests,
+    activeRequests,
+    recentRequests: s.recentRequests,
+    errorProvider: (Date.now() - lastErrorProvider.ts < 10000) ? lastErrorProvider.provider : "",
+  };
+}
+
+/** Serve stats filtered by time period — reads from disk. */
+async function buildStatsFromDisk(period) {
   const db = await getUsageDb();
   let history = db.data.history || [];
 
@@ -551,9 +743,7 @@ export async function getUsageStats(period = "all") {
     })
     .slice(0, 20);
 
-  const lifetimeTotalRequests = typeof db.data.totalRequestsLifetime === "number"
-    ? db.data.totalRequestsLifetime
-    : history.length;
+  const lifetimeTotalRequests = global._inMemStats.totalRequests || history.length;
 
   const stats = {
     totalRequests: lifetimeTotalRequests,
